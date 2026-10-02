@@ -19,6 +19,7 @@ import com.github.feng111627.otafleetrolloutjava.model.ProgressPhase;
 import com.github.feng111627.otafleetrolloutjava.model.RollbackCapture;
 import com.github.feng111627.otafleetrolloutjava.model.RollbackDeviceResult;
 import com.github.feng111627.otafleetrolloutjava.model.RollbackOutcome;
+import com.github.feng111627.otafleetrolloutjava.model.WaveAdvanceResult;
 import com.github.feng111627.otafleetrolloutjava.registry.DeviceRegistry;
 import com.github.feng111627.otafleetrolloutjava.registry.FirmwareRegistry;
 import org.slf4j.Logger;
@@ -90,12 +91,36 @@ public class RolloutOrchestrator {
      * 创建批次：固件必须存在；每台设备必须登记且兼容，任一不满足都按精确原因拒绝，
      * 整个批次不会部分创建。
      */
+    /**
+     * 创建批次（旧接口，等价于“全部设备在唯一一个波次”的单波次批次，
+     * start 后即放开全部设备，语义与上一版本完全一致）。
+     */
     public Batch createBatch(String batchId, String firmwareId, List<String> deviceIds,
                              int failureRateThresholdPercent) {
-        log.info("createBatch input: batchId={}, firmwareId={}, devices={}, threshold={}%",
-                batchId, firmwareId, deviceIds, failureRateThresholdPercent);
+        return createBatch(batchId, firmwareId, deviceIds, failureRateThresholdPercent, null);
+    }
+
+    /**
+     * 创建“分波次放量”批次。
+     *
+     * @param waveDeviceIds 按<b>给定顺序</b>拆出的若干波次，每波一组设备 ID；
+     *                      传 null 表示单波次（旧语义）。要求至少一波、每波非空、
+     *                      恰好覆盖全部设备且无重复无遗漏，否则整批不创建。
+     *                      设备按它在 deviceIds/waveDeviceIds 中的相对顺序保留。
+     */
+    public Batch createBatch(String batchId, String firmwareId, List<String> deviceIds,
+                             int failureRateThresholdPercent, List<List<String>> waveDeviceIds) {
+        log.info("createBatch input: batchId={}, firmwareId={}, devices={}, threshold={}%, waves={}",
+                batchId, firmwareId, deviceIds, failureRateThresholdPercent,
+                waveDeviceIds == null ? 1 : waveDeviceIds.size());
         FirmwarePackage firmware = firmwareRegistry.get(firmwareId);
         Batch batch = new Batch(batchId, firmwareId, failureRateThresholdPercent);
+
+        // 计算每台设备所属波次下标：单波次（waveDeviceIds==null）时全部为波次 0。
+        // 波次结构（空波/重复/覆盖性）必须在逐台兼容性校验之前先验证，整批要么合法创建要么不创建。
+        Map<String, Integer> waveIndexById = resolveWaveIndex(batchId, deviceIds, waveDeviceIds);
+
+        // entries 按设备入批顺序登记（LinkedHashMap），波次顺序由 initWaves 单独维护
         for (String deviceId : deviceIds) {
             Device device = deviceRegistry.get(deviceId);
             CompatibilityResult result = compatibilityService.check(device, firmware);
@@ -105,13 +130,46 @@ public class RolloutOrchestrator {
                 throw new CompatibilityException(result.reason(),
                         "device '" + deviceId + "' incompatible: " + result.detail());
             }
-            batch.putEntry(new BatchDeviceEntry(deviceId, device.getCurrentVersion()));
+            batch.putEntry(new BatchDeviceEntry(
+                    deviceId, device.getCurrentVersion(), waveIndexById.get(deviceId)));
         }
         if (batches.putIfAbsent(batchId, batch) != null) {
             throw new BatchStateException("BATCH_ALREADY_EXISTS", "batch '" + batchId + "' already exists");
         }
-        log.info("createBatch created: batchId={}, size={}", batchId, deviceIds.size());
+
+        if (waveDeviceIds != null) {
+            // 在批次锁内做波次结构校验（覆盖性/无重复/无空波），不满足则整批不创建
+            try {
+                batch.initWaves(waveDeviceIds);
+            } catch (RuntimeException e) {
+                batches.remove(batchId, batch);
+                throw e;
+            }
+            log.info("createBatch created (waves): batchId={}, size={}, waveSizes={}",
+                    batchId, deviceIds.size(),
+                    waveDeviceIds.stream().map(List::size).toList());
+        } else {
+            log.info("createBatch created: batchId={}, size={}", batchId, deviceIds.size());
+        }
         return batch;
+    }
+
+    /**
+     * 推进到下一波动：当前波全部设备到达终态（SUCCEEDED/FAILED）且未熔断才真正放开下一波；
+     * 提前/重复/并发推进均安全——同一波次不会被推进两次，也不会漏波或跳波。
+     * 重复/并发调用拿到的系统状态与只推进一次完全一致（只有一个调用 advanced=true）。
+     */
+    public WaveAdvanceResult advanceWave(String batchId) {
+        Batch batch = getBatch(batchId);
+        WaveAdvanceResult result;
+        synchronized (batch) {
+            result = batch.advanceWaveLocked();
+        }
+        log.info("advanceWave: batch={}, advanced={}, reason={}, wave {} -> {}, batchStatus={}, detail={}",
+                batchId, result.advanced(), result.reasonCode(),
+                result.previousWaveIndex(), result.activeWaveIndex(),
+                result.batchStatus(), result.detail());
+        return result;
     }
 
     public BatchSnapshot start(String batchId) {
@@ -166,9 +224,18 @@ public class RolloutOrchestrator {
     /**
      * 处理设备心跳 / 进度上报。
      *
-     * <p>心跳在任意批次状态下都被接受（仅表示在线）；进度上报仅 ACTIVE 批次接受，
-     * 暂停 / 熔断 / 回滚 / 已完成时按不同原因拒绝。重复上报返回 duplicate=true、
-     * accepted=false，结果与只上报一次完全相同，且不影响批次计数。
+     * <p>心跳在任意批次状态下都被接受（仅表示在线）；进度上报的放行规则：
+     * <ul>
+     *   <li>批次 ACTIVE 且设备属于<b>当前放开波次</b>：正常应用，全部在批次锁内完成；</li>
+     *   <li>设备属于<b>还没放开的后续波次</b>：拒绝 {@code WAVE_NOT_OPENED}，不能提前放量；</li>
+     *   <li>设备属于<b>已经结束的前序波次</b>（波次切换节骨眼上的补报/迟到上报）：
+     *       走与首次相同的幂等路径——重复终态返回 duplicate=true 不计数，终态不翻转，
+     *       结果与只上报一次完全一致，不会多算少算；</li>
+     *   <li>批次 PAUSED：任何波次都不接受进度（{@code BATCH_PAUSED}）；</li>
+     *   <li>批次 CIRCUIT_OPEN / ROLLED_BACK：只放行与设备上次已接受上报完全一致的重复上报
+     *       （熔断回滚后的迟到重复上报，结果与只报一次一致），其余拒绝；</li>
+     *   <li>批次 COMPLETED：重复上报按幂等返回，不作为错误。</li>
+     * </ul>
      */
     public ProgressReportResult report(ProgressEvent event) {
         Batch batch = getBatch(event.batchId());
@@ -180,20 +247,20 @@ public class RolloutOrchestrator {
 
         // 心跳：任意状态接受，永不改状态、永不重复计数
         if (event.phase() == ProgressPhase.HEARTBEAT) {
-            log.info("report heartbeat: batch={}, device={}, state={}",
-                    event.batchId(), event.deviceId(), entry.getState());
+            log.info("report heartbeat: batch={}, device={}, wave={}, state={}",
+                    event.batchId(), event.deviceId(), entry.getWaveIndex(), entry.getState());
             return new ProgressReportResult(false, false, entry.getState(),
                     batch.getStatus(), false, "heartbeat accepted");
         }
 
-        BatchStatus statusAtReport;
         BatchProgressOutcome outcome;
         boolean circuitOpened = false;
         RollbackCapture capture = null;
 
-        // 整个“判定 + 计数 + 熔断触发 + 快照采集”在同一把批次锁内完成，并发上报无法串扰
+        // 整个“判定 + 波次门控 + 计数 + 熔断触发 + 快照采集”在同一把批次锁内完成，并发无法串扰
         synchronized (batch) {
-            statusAtReport = batch.getStatus();
+            BatchStatus statusAtReport = batch.getStatus();
+
             if (statusAtReport == BatchStatus.COMPLETED) {
                 // 已完成批次：重复的成功/进度上报按幂等返回，不作为错误
                 BatchProgressOutcome terminal = batch.applyProgress(event);
@@ -202,19 +269,56 @@ public class RolloutOrchestrator {
                 return new ProgressReportResult(terminal.accepted(), terminal.duplicate(),
                         terminal.deviceState(), BatchStatus.COMPLETED, false, terminal.detail());
             }
+
+            if (statusAtReport == BatchStatus.CIRCUIT_OPEN || statusAtReport == BatchStatus.ROLLED_BACK) {
+                // 熔断中/回滚后：只放行与已接受上报一致的重复上报（迟到重复上报幂等）
+                BatchProgressOutcome dup = batch.rollbackDuplicateOrNull(event);
+                if (dup != null) {
+                    log.info("report in rollback window treated as idempotent duplicate: batch={}, device={}, state={}",
+                            event.batchId(), event.deviceId(), dup.deviceState());
+                    return new ProgressReportResult(dup.accepted(), dup.duplicate(),
+                            dup.deviceState(), batch.getStatus(), false, dup.detail());
+                }
+                String code = statusAtReport == BatchStatus.CIRCUIT_OPEN
+                        ? "BATCH_CIRCUIT_OPEN" : "BATCH_ROLLED_BACK";
+                log.warn("report rejected: batch={}, device={}, status={}, code={}",
+                        event.batchId(), event.deviceId(), statusAtReport, code);
+                throw new BatchStateException(code,
+                        "batch '" + event.batchId() + "' is " + statusAtReport + ", report not accepted");
+            }
+
             if (statusAtReport != BatchStatus.ACTIVE) {
                 String code = switch (statusAtReport) {
                     case PAUSED -> "BATCH_PAUSED";
                     case PENDING -> "BATCH_NOT_STARTED";
-                    case CIRCUIT_OPEN -> "BATCH_CIRCUIT_OPEN";
-                    case ROLLED_BACK -> "BATCH_ROLLED_BACK";
-                    case COMPLETED -> "BATCH_COMPLETED";
                     default -> "BATCH_NOT_ACCEPTING";
                 };
                 log.warn("report rejected: batch={}, device={}, status={}, code={}",
                         event.batchId(), event.deviceId(), statusAtReport, code);
                 throw new BatchStateException(code,
                         "batch '" + event.batchId() + "' is " + statusAtReport + ", report not accepted");
+            }
+
+            // ---- 批次 ACTIVE：波次门控 ----
+            int activeWave = batch.getActiveWaveIndex();
+            int deviceWave = entry.getWaveIndex();
+            if (deviceWave > activeWave) {
+                log.warn("report rejected (wave not opened): batch={}, device={}, deviceWave={}, activeWave={}",
+                        event.batchId(), event.deviceId(), deviceWave, activeWave);
+                throw new BatchStateException("WAVE_NOT_OPENED",
+                        "device '" + event.deviceId() + "' is in wave " + deviceWave
+                                + " but only wave " + activeWave + " is open in batch '"
+                                + event.batchId() + "'");
+            }
+            if (deviceWave < activeWave) {
+                // 波次切换节骨眼的补报/迟到上报：前序波次设备必然已到终态，
+                // applyProgress 只可能返回 duplicate 或拒绝翻转，绝不改计数/状态。
+                outcome = batch.applyProgress(event);
+                log.info("late report for finished wave treated idempotently: batch={}, device={}, deviceWave={}, activeWave={}, duplicate={}, state={}",
+                        event.batchId(), event.deviceId(), deviceWave, activeWave,
+                        outcome.duplicate(), outcome.deviceState());
+                return new ProgressReportResult(outcome.accepted(), outcome.duplicate(),
+                        outcome.deviceState(), batch.getStatus(), false, outcome.detail());
             }
 
             outcome = batch.applyProgress(event);
@@ -226,30 +330,30 @@ public class RolloutOrchestrator {
             }
 
             if (outcome.accepted() && outcome.thresholdReached()) {
-                // 阈值达到：同一次持锁内采集快照并切到 CIRCUIT_OPEN，立即阻断后续上报
+                // 阈值达到：同一次持锁内采集快照并切到 CIRCUIT_OPEN，立即阻断后续所有波次的上报
                 capture = batch.beginRollback();
                 circuitOpened = true;
-                log.warn("CIRCUIT OPEN: batch={}, device={}, succeeded={}, failed={}, threshold={}%",
-                        event.batchId(), event.deviceId(),
+                log.warn("CIRCUIT OPEN: batch={}, device={}, wave={}, succeeded={}, failed={}, threshold={}%",
+                        event.batchId(), event.deviceId(), deviceWave,
                         batch.getSucceededCount(), batch.getFailedCount(),
                         batch.getFailureRateThresholdPercent());
             }
         }
 
-        // 回滚 I/O 在批次锁外执行：快照已定、批次已熔断，不会有新状态混入；
+        // 回滚 I/O 在批次锁外执行：快照已定、批次已熔断，后续波次原地不动；
         // 每台设备的最终状态仍由 RollbackExecutor 在批次锁内提交。
-        RollbackOutcome rollbackOutcome = null;
         if (capture != null) {
-            rollbackOutcome = rollbackExecutor.execute(batch, deviceRegistry, capture);
-            log.warn("auto rollback after circuit: batch={}, rolledBackSucceeded={}, skipped={}, failed={}",
+            RollbackOutcome rollbackOutcome = rollbackExecutor.execute(batch, deviceRegistry, capture);
+            log.warn("auto rollback after circuit: batch={}, rolledBackSucceeded={}, skipped={}, failed={}, waves={}",
                     event.batchId(), rollbackOutcome.rolledBackSucceeded(),
-                    rollbackOutcome.skippedNotStarted(), rollbackOutcome.failedDevices());
+                    rollbackOutcome.skippedNotStarted(), rollbackOutcome.failedDevices(),
+                    rollbackOutcome.waveSummaries());
         }
 
-        log.info("report handled: batch={}, device={}, phase={}, eventId={}, accepted={}, duplicate={}, state={}, status={}, detail={}",
-                event.batchId(), event.deviceId(), event.phase(), event.eventId(),
+        log.info("report handled: batch={}, device={}, wave={}, phase={}, eventId={}, accepted={}, duplicate={}, state={}, status={}, activeWave={}, detail={}",
+                event.batchId(), event.deviceId(), entry.getWaveIndex(), event.phase(), event.eventId(),
                 outcome.accepted(), outcome.duplicate(), outcome.deviceState(),
-                batch.getStatus(), outcome.detail());
+                batch.getStatus(), batch.getActiveWaveIndex(), outcome.detail());
 
         return new ProgressReportResult(outcome.accepted(), outcome.duplicate(),
                 outcome.deviceState(), batch.getStatus(), circuitOpened, outcome.detail());
@@ -268,31 +372,69 @@ public class RolloutOrchestrator {
         return new BatchSnapshot(batch.getBatchId(), batch.getFirmwareId(), batch.getStatus(),
                 batch.totalDevices(), batch.getSucceededCount(), batch.getFailedCount(),
                 batch.getFailureRateThresholdPercent(), batch.isRollbackDone(),
-                batch.snapshotEntries());
+                batch.snapshotEntries(),
+                batch.getWaveCount(), batch.getActiveWaveIndex(), batch.waveSnapshotsLocked());
     }
 
-    /** 回滚已完成时依据当前设备状态复现一份结果 */
+    /** 回滚已完成时依据当前设备状态复现一份结果（含按波次汇总） */
     private RollbackOutcome reproduceRollbackOutcome(Batch batch) {
         List<RollbackDeviceResult> results = new ArrayList<>();
-        int rolledBackSucceeded = 0;
-        int skippedNotStarted = 0;
-        int failedDevices = 0;
         for (BatchDeviceEntry entry : batch.snapshotEntries()) {
             DeviceUpgradeState s = entry.getState();
             results.add(new RollbackDeviceResult(
-                    entry.getDeviceId(), entry.getOriginalVersion(), s, s));
-            switch (s) {
-                case ROLLBACK_SUCCEEDED -> rolledBackSucceeded++;
-                case ROLLBACK_SKIPPED -> skippedNotStarted++;
-                default -> failedDevices++;
-            }
+                    entry.getDeviceId(), entry.getOriginalVersion(), s, s, entry.getWaveIndex()));
         }
-        return new RollbackOutcome(batch.getBatchId(), batch.getStatus(),
-                rolledBackSucceeded, skippedNotStarted, failedDevices, results);
+        return RollbackOutcomeFactory.build(batch, results);
     }
 
-    private Batch getBatch(String batchId) {
-        Batch batch = batches.get(batchId);
+    /**
+     * 解析每台设备的波次下标，并在登记任何设备之前先做波次结构校验：
+     * 至少一波、每波非空、设备都来自 deviceIds、无重复、恰好覆盖全部设备。
+     * waveDeviceIds 为 null 时按单波次处理。
+     */
+    private Map<String, Integer> resolveWaveIndex(String batchId, List<String> deviceIds,
+                                                  List<List<String>> waveDeviceIds) {
+        Map<String, Integer> indexById = new java.util.HashMap<>();
+        if (waveDeviceIds == null) {
+            for (String id : deviceIds) {
+                indexById.put(id, 0);
+            }
+            return indexById;
+        }
+        if (waveDeviceIds.isEmpty()) {
+            throw new BatchStateException("WAVES_EMPTY",
+                    "batch '" + batchId + "' must define at least one wave");
+        }
+        java.util.Set<String> declared = new java.util.HashSet<>(deviceIds);
+        java.util.Set<String> seen = new java.util.HashSet<>();
+        for (int w = 0; w < waveDeviceIds.size(); w++) {
+            List<String> waveIds = waveDeviceIds.get(w);
+            if (waveIds == null || waveIds.isEmpty()) {
+                throw new BatchStateException("WAVE_EMPTY",
+                        "batch '" + batchId + "' wave " + w + " must not be empty");
+            }
+            for (String id : waveIds) {
+                if (!declared.contains(id)) {
+                    throw new BatchStateException("WAVE_DEVICE_NOT_IN_BATCH",
+                            "device '" + id + "' in wave " + w
+                                    + " is not in the device list of batch '" + batchId + "'");
+                }
+                if (!seen.add(id)) {
+                    throw new BatchStateException("WAVE_DEVICE_DUPLICATED",
+                            "device '" + id + "' appears in more than one wave of batch '" + batchId + "'");
+                }
+                indexById.put(id, w);
+            }
+        }
+        if (seen.size() != deviceIds.size()) {
+            throw new BatchStateException("WAVES_NOT_COVERING_ALL_DEVICES",
+                    "waves cover " + seen.size() + " devices but batch lists " + deviceIds.size()
+                            + " devices in batch '" + batchId + "'");
+        }
+        return indexById;
+    }
+
+    private Batch getBatch(String batchId) {        Batch batch = batches.get(batchId);
         if (batch == null) {
             throw new BatchStateException("BATCH_NOT_FOUND", "batch '" + batchId + "' not found");
         }

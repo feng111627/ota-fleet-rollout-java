@@ -6,5 +6,12 @@ package com.github.feng111627.otafleetrolloutjava.model;
 public record RollbackDeviceResult(String deviceId,
                                    String originalVersion,
                                    DeviceUpgradeState beforeState,
-                                   DeviceUpgradeState outcome) {
+                                   DeviceUpgradeState outcome,
+                                   int waveIndex) {
+
+    /** 兼容旧用法（默认波次 0） */
+    public RollbackDeviceResult(String deviceId, String originalVersion,
+                                DeviceUpgradeState beforeState, DeviceUpgradeState outcome) {
+        this(deviceId, originalVersion, beforeState, outcome, 0);
+    }
 }
