@@ -35,13 +35,19 @@ import java.util.List;
 public class RollbackExecutor {
 
     private final DeviceRestoreOperator restoreOperator;
+    private final RollbackAbortTrigger abortTrigger;
 
     public RollbackExecutor() {
         this(new LocalRestoreOperator());
     }
 
     public RollbackExecutor(DeviceRestoreOperator restoreOperator) {
+        this(restoreOperator, RollbackAbortTrigger.NOOP);
+    }
+
+    public RollbackExecutor(DeviceRestoreOperator restoreOperator, RollbackAbortTrigger abortTrigger) {
         this.restoreOperator = restoreOperator;
+        this.abortTrigger = abortTrigger == null ? RollbackAbortTrigger.NOOP : abortTrigger;
     }
 
     /**
@@ -65,28 +71,33 @@ public class RollbackExecutor {
             DeviceUpgradeState before = item.beforeState();
             DeviceUpgradeState outcome;
 
-            // 重试幂等：已是回滚终态的设备不再重复处置
+            // 重试幂等：已是回滚终态的设备不再重复处置，也不再触发中止钩子
             if (before == DeviceUpgradeState.ROLLBACK_SUCCEEDED
                     || before == DeviceUpgradeState.ROLLBACK_SKIPPED
                     || before == DeviceUpgradeState.ROLLBACK_FAILED) {
                 outcome = before;
-            } else if (before == DeviceUpgradeState.NOT_STARTED) {
-                // 还没开始升级：设备仍在原版本，无需回滚
-                outcome = DeviceUpgradeState.ROLLBACK_SKIPPED;
-            } else if (before == DeviceUpgradeState.SUCCEEDED) {
-                // 已升级成功：必须把版本恢复到建批时快照的原版本
-                Device device = deviceRegistry.get(entry.getDeviceId());
-                boolean ok;
-                try {
-                    ok = restoreOperator.restore(device, item.originalVersion());
-                } catch (RuntimeException e) {
-                    // 恢复过程报错/中断：不写回一个“假成功”，标记人工介入
-                    ok = false;
-                }
-                outcome = ok ? DeviceUpgradeState.ROLLBACK_SUCCEEDED : DeviceUpgradeState.ROLLBACK_FAILED;
             } else {
-                // IN_PROGRESS / FAILED：刷写中途或已失败，固件状态不确定，禁止盲目操作
-                outcome = DeviceUpgradeState.ROLLBACK_FAILED;
+                // 模拟“回滚整体中途报错/被打断”：钩子在处置未处理设备前抛出时，本轮立即
+                // 中断，已提交终态的设备保持现状、批次保持 CIRCUIT_OPEN（不会走到 completeRollback）。
+                abortTrigger.check(batch.getBatchId(), entry.getDeviceId(), before);
+                if (before == DeviceUpgradeState.NOT_STARTED) {
+                    // 还没开始升级：设备仍在原版本，无需回滚
+                    outcome = DeviceUpgradeState.ROLLBACK_SKIPPED;
+                } else if (before == DeviceUpgradeState.SUCCEEDED) {
+                    // 已升级成功：必须把版本恢复到建批时快照的原版本
+                    Device device = deviceRegistry.get(entry.getDeviceId());
+                    boolean ok;
+                    try {
+                        ok = restoreOperator.restore(device, item.originalVersion());
+                    } catch (RuntimeException e) {
+                        // 恢复过程报错/中断：不写回一个“假成功”，标记人工介入
+                        ok = false;
+                    }
+                    outcome = ok ? DeviceUpgradeState.ROLLBACK_SUCCEEDED : DeviceUpgradeState.ROLLBACK_FAILED;
+                } else {
+                    // IN_PROGRESS / FAILED：刷写中途或已失败，固件状态不确定，禁止盲目操作
+                    outcome = DeviceUpgradeState.ROLLBACK_FAILED;
+                }
             }
 
             // 锁内提交最终状态，保证与批次计数/状态观察一致
@@ -104,7 +115,8 @@ public class RollbackExecutor {
         }
 
         batch.completeRollback();
-        return new RollbackOutcome(batch.getBatchId(), batch.getStatus(),
+        RollbackOutcome outcome = new RollbackOutcome(batch.getBatchId(), batch.getStatus(),
                 rolledBackSucceeded, skippedNotStarted, failedDevices, results);
+        return outcome.withWaveResults(RollbackWaveGrouper.group(batch, results));
     }
 }
