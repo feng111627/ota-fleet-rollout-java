@@ -300,6 +300,16 @@ public class Batch {
             items.add(new RollbackCaptureItem(entry, entry.getState(), entry.getOriginalVersion()));
         }
         status = BatchStatus.CIRCUIT_OPEN;
+        // 波次冻结（与状态切换同一把锁）：曾放开过的波次（ACTIVE/FINISHED）随回滚开始
+        // 即标记 ROLLED_BACK——此后任何时刻查批次都不会再有波次显示“正在放量/进行中”；
+        // 始终没轮到的波次保持 PENDING 原样不动，进度不被带跑。
+        // 中断重试会再次走到这里，已冻结的波次状态不变，天然幂等。
+        for (Wave wave : waves) {
+            if (wave.getStatus() == WaveStatus.ACTIVE || wave.getStatus() == WaveStatus.FINISHED) {
+                wave.setStatus(WaveStatus.ROLLED_BACK);
+            }
+        }
+        activeWaveIndex = -1;
         return new RollbackCapture(items);
     }
 
@@ -511,16 +521,22 @@ public class Batch {
         List<WaveSnapshot> result = new ArrayList<>(waves.size());
         for (Wave wave : waves) {
             int succ = 0, fail = 0, inProgress = 0, notStarted = 0;
+            int rolledBack = 0, skipped = 0, rollbackFailed = 0;
             for (String id : wave.getDeviceIds()) {
                 switch (entries.get(id).getState()) {
                     case SUCCEEDED -> succ++;
                     case FAILED -> fail++;
                     case IN_PROGRESS -> inProgress++;
-                    default -> notStarted++;
+                    case NOT_STARTED -> notStarted++;
+                    // 回滚终态单独计数：已回滚的设备绝不悄悄算进“未开始”
+                    case ROLLBACK_SUCCEEDED -> rolledBack++;
+                    case ROLLBACK_SKIPPED -> skipped++;
+                    case ROLLBACK_FAILED -> rollbackFailed++;
                 }
             }
             result.add(new WaveSnapshot(wave.getIndex(), wave.getStatus(),
                     wave.getDeviceIds().size(), succ, fail, inProgress, notStarted,
+                    rolledBack, skipped, rollbackFailed,
                     wave.getDeviceIds()));
         }
         return result;

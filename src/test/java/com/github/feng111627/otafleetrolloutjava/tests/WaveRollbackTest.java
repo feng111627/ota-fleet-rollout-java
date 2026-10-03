@@ -116,7 +116,9 @@ class WaveRollbackTest {
         assertEquals(2, snap.waves().get(2).waveIndex());
         assertEquals(com.github.feng111627.otafleetrolloutjava.model.WaveStatus.PENDING,
                 snap.waves().get(2).status());
-        assertEquals(2, snap.waves().get(2).notStartedCount());
+        // 未轮到的波次：升级进度保持 0，设备在回滚统计中体现为“未开始跳过”，不算进“未开始”
+        assertEquals(0, snap.waves().get(2).notStartedCount());
+        assertEquals(2, snap.waves().get(2).rollbackSkippedCount());
         BatchStateException blocked = assertThrows(BatchStateException.class,
                 () -> orch.advanceWave("rb"));
         log.info("[rb] advance after rollback rejected code={}", blocked.getReasonCode());
