@@ -71,9 +71,10 @@ orch.createBatch("b1", "fw-2.0",
 
 | 状态 | 含义 |
 | --- | --- |
-| `PENDING` | 尚未放开，设备上报一律拒绝（`WAVE_NOT_OPENED`） |
+| `PENDING` | 尚未放开，设备上报一律拒绝（`WAVE_NOT_OPENED`）；回滚后仍没轮到的波次也保持此状态（原样没动） |
 | `ACTIVE` | 当前唯一放开的波次，只有这一波的设备接受进度上报 |
 | `FINISHED` | 波内全部设备到达终态（SUCCEEDED/FAILED） |
+| `ROLLED_BACK` | 已放开过、随批次回滚完成处置（由 ACTIVE/FINISHED 收敛而来），区别于“压根没轮到”的 PENDING |
 
 推进规则（`advanceWave()`，返回 `WaveAdvanceResult` 带原因码）：
 
@@ -88,7 +89,7 @@ orch.createBatch("b1", "fw-2.0",
    对已 COMPLETED 的批次推进返回 `BATCH_COMPLETED`（幂等）。
 
 每个波次可通过 `BatchSnapshot.waves()`（`List<WaveSnapshot>`）查到各自独立的
-状态、设备数与成功/失败/进行中/未开始计数。
+状态、设备数与统计计数（放量期与回滚后两套口径，见 4.5 节）。
 
 ### 暂停 / 恢复对所有波次生效
 
@@ -179,6 +180,32 @@ orch.createBatch("b1", "fw-2.0",
   批次停留 `CIRCUIT_OPEN`；重试时已提交回滚终态的设备不再恢复，未处理设备接着处理，
   最终收敛到 `ROLLED_BACK`，不留半推半退状态（恢复 I/O 不会对同一设备重复执行）。
 
+### 4.5 回滚后各波次的状态与统计口径
+
+**波次状态怎么变**（自动熔断回滚与人工回滚同一个入口，表现完全一致）：
+
+- 回滚开始（批次切到 `CIRCUIT_OPEN`）的同一把锁内，波次状态即收敛：
+  **已放开过的波次**（ACTIVE/FINISHED）一律变为 `ROLLED_BACK`；
+  **从未放开的后续波次**保持 `PENDING`（未开始，原样没动，进度不被带跑）；
+  `activeWaveIndex` 复位为 -1（不再存在“当前放开波次”）。
+- 因此**回滚结束后不会再有任何波次显示“进行中”（ACTIVE）**；
+  回滚中途被打断时波次也不会停在 ACTIVE，重试完成后状态与统计收敛到同一最终结果。
+- 重复回滚、回滚过程中/之后并发查询批次：波次状态与计数稳定一致
+  （状态收敛与计数都在批次锁内完成）。
+
+**按波次能查到哪些统计**（`WaveSnapshot`，两套口径互不混算）：
+
+| 时期 | 字段 | 含义 |
+| --- | --- | --- |
+| 放量期 | `succeededCount` / `failedCount` / `inProgressCount` / `notStartedCount` | 升级成功 / 失败 / 进行中 / 未开始，四者之和 = `totalDevices` |
+| 回滚后 | `rolledBackCount` / `skippedCount` / `needsManualCount` | 被恢复回原版本 / 本来没开始被跳过 / 状态不明需人工，三者之和 = `totalDevices` |
+
+- 回滚后升级期四个计数清零，**已回滚掉的设备不会被算进“未开始”**；
+  每个波次的“恢复 + 跳过 + 人工”恰好等于该波设备总数。
+- 按波次统计与整批回滚结果严格一致：`WaveSnapshot` 的回滚三口径逐波等于
+  `RollbackOutcome.waveSummaries()` 的 `rolledBackSucceeded / skippedNotStarted /
+  failedDevices`，各波之和等于整批 `RollbackOutcome` 的总计数。
+
 ## 5. 进度上报的幂等与并发
 
 - 心跳（HEARTBEAT）任意状态下都接受，永不改状态、永不计数。
@@ -211,7 +238,7 @@ exception/    OtaException / CompatibilityException / BatchStateException（携�
 # 编译
 mvn compile
 
-# 运行全部单测（共 30 个 = 上一轮 18 个 + 波次 12 个，全部本地、无外部服务）
+# 运行全部单测（共 34 个 = 上一轮 30 个 + 回滚波次一致性 4 个，全部本地、无外部服务）
 mvn test
 
 # 只看某一类
@@ -225,6 +252,9 @@ mvn -Dtest=WaveProgressionTest            test   # 波次拆分/只放开第一�
 mvn -Dtest=WaveConcurrencyTest            test   # 24 线程并发推进只放开一次 + 100 台/5 波并发上报计数
 mvn -Dtest=WaveRollbackTest               test   # 跨波次熔断回滚/后续波次冻结/回滚中断续跑/整批暂停恢复
 mvn -Dtest=WaveLateReportTest             test   # 波次切换节骨眼与回滚后的迟到/重复上报幂等
+# —— 本轮新增：回滚后波次状态与统计一致性 ——
+mvn -Dtest=WaveRollbackStatusConsistencyTest test # 自动熔断/人工/中断重试回滚后无波次进行中、
+                                                  # 各波“恢复/跳过/人工”与整批结果一致、并发查询稳定
 ```
 
 关键并发场景：`WaveConcurrencyTest` 用 100 台设备拆成 5 波、每波 20 台，

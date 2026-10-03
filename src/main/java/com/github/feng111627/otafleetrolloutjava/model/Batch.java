@@ -300,7 +300,27 @@ public class Batch {
             items.add(new RollbackCaptureItem(entry, entry.getState(), entry.getOriginalVersion()));
         }
         status = BatchStatus.CIRCUIT_OPEN;
+        convergeWavesForRollbackLocked();
         return new RollbackCapture(items);
+    }
+
+    /**
+     * 回滚开始的同一锁内收敛波次状态（自动熔断与人工回滚共用此入口，表现一致）：
+     * <ul>
+     *   <li>已放开过的波次（ACTIVE/FINISHED）一律收敛为 ROLLED_BACK——
+     *       回滚结束后不会再有任何波次显示“正在放量/进行中”；</li>
+     *   <li>从未放开的后续波次（PENDING）原地不动，保持“未开始”，进度不被带跑；</li>
+     *   <li>中断重试时再次进入本方法：波次已是 ROLLED_BACK/PENDING，幂等不变。</li>
+     * </ul>
+     * 同时复位 activeWaveIndex：熔断/回滚后不存在“当前放开波次”。
+     */
+    private void convergeWavesForRollbackLocked() {
+        for (Wave wave : waves) {
+            if (wave.getStatus() == WaveStatus.ACTIVE || wave.getStatus() == WaveStatus.FINISHED) {
+                wave.setStatus(WaveStatus.ROLLED_BACK);
+            }
+        }
+        activeWaveIndex = -1;
     }
 
     /** 回滚执行完成：CIRCUIT_OPEN -> ROLLED_BACK（幂等标记） */
@@ -505,22 +525,33 @@ public class Batch {
         return null;
     }
 
-    /** 锁内生成每个波次各自的进度与统计快照 */
+    /**
+     * 锁内生成每个波次各自的进度与统计快照。
+     *
+     * <p>回滚终态（ROLLBACK_*）设备计入各自的回滚口径（rolledBack/skipped/needsManual），
+     * 不再落入 notStarted：回滚后每波“恢复 + 跳过 + 人工”三者之和等于波次设备总数，
+     * 与整批回滚处置结果（RollbackOutcome.waveSummaries）保持一致。
+     */
     public synchronized List<WaveSnapshot> waveSnapshotsLocked() {
         ensureWavesLocked();
         List<WaveSnapshot> result = new ArrayList<>(waves.size());
         for (Wave wave : waves) {
             int succ = 0, fail = 0, inProgress = 0, notStarted = 0;
+            int rolledBack = 0, skipped = 0, needsManual = 0;
             for (String id : wave.getDeviceIds()) {
                 switch (entries.get(id).getState()) {
                     case SUCCEEDED -> succ++;
                     case FAILED -> fail++;
                     case IN_PROGRESS -> inProgress++;
+                    case ROLLBACK_SUCCEEDED -> rolledBack++;
+                    case ROLLBACK_SKIPPED -> skipped++;
+                    case ROLLBACK_FAILED -> needsManual++;
                     default -> notStarted++;
                 }
             }
             result.add(new WaveSnapshot(wave.getIndex(), wave.getStatus(),
                     wave.getDeviceIds().size(), succ, fail, inProgress, notStarted,
+                    rolledBack, skipped, needsManual,
                     wave.getDeviceIds()));
         }
         return result;
